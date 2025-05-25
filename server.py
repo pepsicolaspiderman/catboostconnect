@@ -39,22 +39,6 @@ class Recommendation(BaseModel):
 class RecommendationsResponse(BaseModel):
     recommendations: List[Recommendation]
 
-    predictions: List[Prediction]
-
-# --- Pydantic models for recommendations ---
-class RecommendationsRequest(BaseModel):
-    avg_totals: Dict[str, float]
-    last_totals: Dict[str, float]
-
-class Recommendation(BaseModel):
-    category: str
-    current: float
-    benchmark: float
-    advice: str
-
-class RecommendationsResponse(BaseModel):
-    recommendations: List[Recommendation]
-
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"error": str(exc)})
@@ -62,14 +46,14 @@ async def generic_exception_handler(request: Request, exc: Exception):
 # --- Forecast endpoint (original logic) ---
 @app.post("/forecast", response_model=ForecastResponse)
 def forecast(req: ForecastRequest):
-    # 1. Построение DataFrame из входного JSON
+    # 1. Load and prepare input data
     df = pd.DataFrame([t.dict() for t in req.transactions])
     if df.empty:
         raise HTTPException(status_code=400, detail="Список транзакций пуст")
     df['date'] = pd.to_datetime(df['date'])
-
-    # 2. Ресемплинг по дням и заполнение нулей
     categories = df['category'].unique()
+
+    # 2. Resample daily and fill zeros
     frames = []
     for cat in categories:
         tmp = (
@@ -83,7 +67,7 @@ def forecast(req: ForecastRequest):
         frames.append(tmp.reset_index())
     df_full = pd.concat(frames, ignore_index=True)
 
-    # 3. Признаки
+    # 3. Generate features
     df_full['category'] = df_full['category'].astype('category')
     df_full['day'] = df_full['date'].dt.day
     df_full['month'] = df_full['date'].dt.month
@@ -104,16 +88,16 @@ def forecast(req: ForecastRequest):
     df_full['last_nz'] = df_full.groupby('category')['last_nz'].ffill()
     df_full['days_since'] = (df_full['date'] - df_full['last_nz']).dt.days.fillna(999).astype(int)
 
-    # 4. Подготовка данных
+    # 4. Prepare training data
     df_full['target_bin'] = (df_full['amount']>0).astype(int)
     features = ['category','day','month','dow','is_weekend','lag_1','lag_7','roll30_mean','roll30_std','days_since']
-    X = df_full[features]
+    X = df_full[features].copy()
     X['category'] = X['category'].astype('category')
     y_bin = df_full['target_bin']
     mask = y_bin==1
     y_amt = df_full.loc[mask,'amount']
 
-    # 5. Обучение моделей
+    # 5. Train models
     clf = CatBoostClassifier(
         iterations=200, learning_rate=0.1, depth=6,
         random_seed=42, verbose=False, allow_writing_files=False
@@ -126,7 +110,7 @@ def forecast(req: ForecastRequest):
     )
     reg.fit(X.loc[mask], y_amt, cat_features=['category'])
 
-    # 6. Прогноз
+    # 6. Forecast
     last_date = df_full['date'].max()
     hist = df_full.copy()
     future = []
@@ -136,7 +120,7 @@ def forecast(req: ForecastRequest):
             sub = hist[hist['category']==cat]
             row = {
                 'category':cat,
-                'day':d.day,'month':d.month,'dow':d.dayofweek,
+                'day':d.day, 'month':d.month, 'dow':d.dayofweek,
                 'is_weekend':int(d.dayofweek in [5,6]),
                 'lag_1':sub['amount'].iloc[-1],
                 'lag_7':sub['amount'].shift(6).iloc[-1] if len(sub)>=7 else 0,
@@ -151,26 +135,8 @@ def forecast(req: ForecastRequest):
             val = max(0.0, round(p*r,2))
             future.append({'date':d.strftime('%Y-%m-%d'),'category':cat,'value':val})
             hist = pd.concat([hist,pd.DataFrame([{**row,'amount':val,'date':d}])],ignore_index=True)
-
-        return ForecastResponse(predictions=future)
-
-# --- Recommendations endpoint ---
-@app.post("/recommendations", response_model=RecommendationsResponse)
-def recommendations(req: RecommendationsRequest):
-    recs: List[Recommendation] = []
-    threshold = 1.1  # recommend if current > 110% of avg
-    for cat, current in req.last_totals.items():
-        avg = req.avg_totals.get(cat, 0)
-        if avg > 0 and current > avg * threshold:
-            reduction = round((current - avg) / current * 100)
-            advice = f"Постарайтесь сократить траты на {cat} на {reduction}%"
-            recs.append(Recommendation(
-                category=cat,
-                current=current,
-                benchmark=avg,
-                advice=advice
-            ))
-    return RecommendationsResponse(recommendations=recs)
+    # return after loops
+    return ForecastResponse(predictions=future)
 
 # --- Recommendations endpoint ---
 @app.post("/recommendations", response_model=RecommendationsResponse)
@@ -181,7 +147,7 @@ def recommendations(req: RecommendationsRequest):
         avg = req.avg_totals.get(cat, 0)
         if avg > 0 and current > avg * threshold:
             reduction = round((current - avg) / current * 100)
-            advice = f"Постарайтесь сократить траты на {cat} на {reduction}%"
+            advice = f"Постарайтесь сократить траты на {cat} на {reduction}%."
             recs.append(Recommendation(
                 category=cat,
                 current=current,
