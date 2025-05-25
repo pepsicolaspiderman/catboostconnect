@@ -1,11 +1,9 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import List, Dict
+from typing import List
 import pandas as pd
-from catboost import CatBoostClassifier, CatBoostRegressor
-from sklearn.metrics import accuracy_score, roc_auc_score, mean_squared_error, mean_absolute_error
-from math import sqrt
+from catboost import CatBoostRegressor
 
 app = FastAPI(title="Сервис прогнозирования трат по категориям")
 
@@ -25,37 +23,35 @@ class Prediction(BaseModel):
     value: float    # Прогнозируемая сумма траты
 
 class ForecastResponse(BaseModel):
-    predictions: List[Prediction]          # Список прогнозов
+    predictions: List[Prediction]
 
-# Глобальный обработчик исключений
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"error": str(exc)})
 
 @app.post("/forecast", response_model=ForecastResponse)
 def forecast(req: ForecastRequest):
-    # 1. Построение DataFrame из входного JSON
+    # 1. Входные данные
     df = pd.DataFrame([t.dict() for t in req.transactions])
     if df.empty:
         raise HTTPException(status_code=400, detail="Список транзакций пуст")
     df['date'] = pd.to_datetime(df['date'])
 
-    # 2. Ресемплинг по дням и заполнение нулей для каждой категории
+    # 2. Ресемплинг по дням с заполнением нулями
     categories = df['category'].unique()
     frames = []
     for cat in categories:
         tmp = (
             df[df['category'] == cat]
               .set_index('date')['amount']
-              .resample('D').sum()
-              .to_frame()
+              .resample('D').sum().to_frame()
         )
         tmp['category'] = cat
         tmp['amount'] = tmp['amount'].fillna(0)
         frames.append(tmp.reset_index())
     df_full = pd.concat(frames, ignore_index=True)
 
-    # 3. Признаки
+    # 3. Создание фичей
     df_full['day'] = df_full['date'].dt.day
     df_full['month'] = df_full['date'].dt.month
     df_full['dow'] = df_full['date'].dt.dayofweek
@@ -75,23 +71,27 @@ def forecast(req: ForecastRequest):
     df_full['last_nz'] = df_full.groupby('category')['last_nz'].ffill()
     df_full['days_since'] = (df_full['date'] - df_full['last_nz']).dt.days.fillna(999).astype(int)
 
-    # 4. Подготовка данных
-    df_full['target_bin'] = (df_full['amount'] > 0).astype(int)
-    features = ['category','day','month','dow','is_weekend','lag_1','lag_7','roll30_mean','roll30_std','days_since']
+    # 4. Подготовка данных для регрессии на все дни (включая нули)
+    features = [
+        'category','day','month','dow','is_weekend',
+        'lag_1','lag_7','roll30_mean','roll30_std','days_since'
+    ]
     cat_feats = ['category']
-    X = df_full[features]
-    y_bin = df_full['target_bin']
-    mask = y_bin == 1
-    y_amt = df_full.loc[mask, 'amount']
+    X_full = df_full[features]
+    X_full['category'] = X_full['category'].astype('category')
+    y_full = df_full['amount']
 
-    # 5. Обучение моделей
-    clf = CatBoostClassifier(iterations=200, learning_rate=0.1, depth=6,
-                             random_seed=42, verbose=False, allow_writing_files=False)
-    clf.fit(X, y_bin, cat_features=cat_feats)
-
-    reg = CatBoostRegressor(iterations=300, learning_rate=0.05, depth=6, l2_leaf_reg=5,
-                            random_seed=42, verbose=False, allow_writing_files=False)
-    reg.fit(X.loc[mask], y_amt, cat_features=cat_feats)
+    # 5. Обучение одного регрессора на всех данных
+    reg_all = CatBoostRegressor(
+        iterations=300,
+        learning_rate=0.05,
+        depth=6,
+        l2_leaf_reg=5,
+        random_seed=42,
+        verbose=False,
+        allow_writing_files=False
+    )
+    reg_all.fit(X_full, y_full, cat_features=cat_feats)
 
     # 6. Прогноз на будущее
     last_date = df_full['date'].max()
@@ -116,9 +116,7 @@ def forecast(req: ForecastRequest):
             }
             Xf = pd.DataFrame([row])[features]
             Xf['category'] = Xf['category'].astype('category')
-            p = clf.predict_proba(Xf)[0, 1]
-            r = float(reg.predict(Xf)[0])
-            val = p * r
+            val = float(reg_all.predict(Xf)[0])
 
             future_preds.append({
                 'date': d.strftime('%Y-%m-%d'),
