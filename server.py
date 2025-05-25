@@ -8,7 +8,7 @@ from catboost import CatBoostRegressor
 app = FastAPI(title="Сервис прогнозирования трат по категориям")
 
 # Pydantic-модели
-default_freq_threshold = 0.3  # порог доли активных дней для разделения частых и редких
+default_freq_threshold = 0.1  # порог доли активных дней для разделения частых и редких
 
 class Transaction(BaseModel):
     date: str        # "YYYY-MM-DD"
