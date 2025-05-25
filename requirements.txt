@@ -4,4 +4,3 @@ catboost
 pandas
 numpy
 scikit-learn
-python-multipart
