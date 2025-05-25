@@ -47,7 +47,7 @@ def forecast(req: ForecastRequest):
         # добавляем будущие дни с NaN
         last = series.index.max()
         future_idx = pd.date_range(last + pd.Timedelta(days=1), periods=req.forecast_days, freq='D')
-        series = series.append(pd.Series(index=future_idx, data=[0]*len(future_idx)))
+        series = pd.concat([series, pd.Series(data=[0]*len(future_idx), index=future_idx, name='amount')])
         frame = series.to_frame()
         frame['category'] = cat
         frame['day'] = frame.index.day
