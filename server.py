@@ -51,14 +51,17 @@ def forecast(req: ForecastRequest):
         frames.append(tmp.reset_index())
     df_full = pd.concat(frames, ignore_index=True)
 
-    # 3. Создание фичей
+    # 3. Создание фичей с учётом месячной периодики
     df_full['day'] = df_full['date'].dt.day
     df_full['month'] = df_full['date'].dt.month
     df_full['dow'] = df_full['date'].dt.dayofweek
     df_full['is_weekend'] = df_full['dow'].isin([5,6]).astype(int)
     df_full = df_full.sort_values(['category','date'])
+    # Лаги на 1, 7 и 30 дней
     df_full['lag_1'] = df_full.groupby('category')['amount'].shift(1).fillna(0)
     df_full['lag_7'] = df_full.groupby('category')['amount'].shift(7).fillna(0)
+    df_full['lag_30'] = df_full.groupby('category')['amount'].shift(30).fillna(0)
+    # Скользящие статистики
     df_full['roll30_mean'] = (
         df_full.groupby('category')['amount']
                .transform(lambda x: x.shift(1).rolling(30, min_periods=1).mean())
@@ -67,6 +70,7 @@ def forecast(req: ForecastRequest):
         df_full.groupby('category')['amount']
                .transform(lambda x: x.shift(1).rolling(30, min_periods=1).std().fillna(0))
     )
+    # Дней с последней ненулевой траты
     df_full['last_nz'] = df_full['date'].where(df_full['amount'] > 0)
     df_full['last_nz'] = df_full.groupby('category')['last_nz'].ffill()
     df_full['days_since'] = (df_full['date'] - df_full['last_nz']).dt.days.fillna(999).astype(int)
@@ -74,10 +78,10 @@ def forecast(req: ForecastRequest):
     # 4. Подготовка данных для регрессии на все дни (включая нули)
     features = [
         'category','day','month','dow','is_weekend',
-        'lag_1','lag_7','roll30_mean','roll30_std','days_since'
+        'lag_1','lag_7','lag_30','roll30_mean','roll30_std','days_since'
     ]
     cat_feats = ['category']
-    X_full = df_full[features]
+    X_full = df_full[features].copy()
     X_full['category'] = X_full['category'].astype('category')
     y_full = df_full['amount']
 
@@ -110,6 +114,7 @@ def forecast(req: ForecastRequest):
                 'is_weekend': int(d.dayofweek in [5, 6]),
                 'lag_1': sub['amount'].iloc[-1],
                 'lag_7': sub['amount'].shift(6).iloc[-1] if len(sub) >= 7 else 0,
+                'lag_30': sub['amount'].shift(29).iloc[-1] if len(sub) >= 30 else 0,
                 'roll30_mean': sub['amount'].shift(1).rolling(30, min_periods=1).mean().iloc[-1],
                 'roll30_std': sub['amount'].shift(1).rolling(30, min_periods=1).std().fillna(0).iloc[-1],
                 'days_since': int((d - (sub[sub['amount']>0]['date'].max() if not sub[sub['amount']>0].empty else d)).days)
