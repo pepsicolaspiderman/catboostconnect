@@ -13,12 +13,26 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df['month'] = df['date'].dt.month
     df['dow'] = df['date'].dt.dayofweek
     df['is_weekend'] = df['dow'].isin([5,6]).astype(int)
+    # Лаги различных порядков
     for lag in [1,2,3,7,14,30]:
         df[f'lag_{lag}'] = df.groupby('category')['amount'].shift(lag).fillna(0)
+    # Скользящие суммы и средние
     df['roll_7_sum'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(7, min_periods=1).sum())
     df['roll_7_mean'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(7, min_periods=1).mean())
     df['roll_30_sum'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(30, min_periods=1).sum())
     df['roll_30_mean'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(30, min_periods=1).mean())
+    # Количество дней с тратами
+    df['roll_7_count'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(7, min_periods=1).apply(lambda y: (y>0).sum(), raw=True))
+    df['roll_30_count'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(30, min_periods=1).apply(lambda y: (y>0).sum(), raw=True))
+    # Перцентиль (75%)
+    df['roll_30_p75'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(30, min_periods=1).quantile(0.75))
+    # Временные признаки: фурье для недельного и месячного циклов
+    import numpy as np
+    df['sin_dow'] = np.sin(2 * np.pi * df['dow'] / 7)
+    df['cos_dow'] = np.cos(2 * np.pi * df['dow'] / 7)
+    df['sin_dom'] = np.sin(2 * np.pi * (df['day'] - 1) / 30)
+    df['cos_dom'] = np.cos(2 * np.pi * (df['day'] - 1) / 30)
+    # Дни с последней ненулевой транзакцией
     df['last_nz'] = df['date'].where(df['amount']>0)
     df['last_nz'] = df.groupby('category')['last_nz'].ffill()
     df['days_since'] = (df['date'] - df['last_nz']).dt.days.fillna(999).astype(int)
@@ -61,7 +75,13 @@ def forecast(req: ForecastRequest):
         frames.append(tmp)
     hist = pd.concat(frames, ignore_index=True).sort_values(['category','date']).reset_index(drop=True)
     hist = build_features(hist)
-    feats = ['category','day','month','dow','is_weekend'] + [f'lag_{lag}' for lag in [1,2,3,7,14,30]] + ['roll_7_sum','roll_7_mean','roll_30_sum','roll_30_mean','days_since']
+    feats = [
+        'category','day','month','dow','is_weekend',
+        'sin_dow','cos_dow','sin_dom','cos_dom',
+        ] + [f'lag_{lag}' for lag in [1,2,3,7,14,30]] + [
+        'roll_7_sum','roll_7_mean','roll_30_sum','roll_30_mean',
+        'roll_7_count','roll_30_count','roll_30_p75','days_since'
+    ]
     hist['target_bin'] = (hist['amount']>0).astype(int)
     X = hist[feats].copy()
     X['category'] = X['category'].astype('category')
