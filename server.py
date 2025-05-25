@@ -57,11 +57,11 @@ def forecast(req: ForecastRequest):
     df_full['dow'] = df_full['date'].dt.dayofweek
     df_full['is_weekend'] = df_full['dow'].isin([5,6]).astype(int)
     df_full = df_full.sort_values(['category','date'])
-    # Лаги на 1, 7 и 30 дней
+
+    # Лаги и статистики
     df_full['lag_1'] = df_full.groupby('category')['amount'].shift(1).fillna(0)
     df_full['lag_7'] = df_full.groupby('category')['amount'].shift(7).fillna(0)
     df_full['lag_30'] = df_full.groupby('category')['amount'].shift(30).fillna(0)
-    # Скользящие статистики
     df_full['roll30_mean'] = (
         df_full.groupby('category')['amount']
                .transform(lambda x: x.shift(1).rolling(30, min_periods=1).mean())
@@ -70,22 +70,32 @@ def forecast(req: ForecastRequest):
         df_full.groupby('category')['amount']
                .transform(lambda x: x.shift(1).rolling(30, min_periods=1).std().fillna(0))
     )
-    # Дней с последней ненулевой траты
     df_full['last_nz'] = df_full['date'].where(df_full['amount'] > 0)
     df_full['last_nz'] = df_full.groupby('category')['last_nz'].ffill()
     df_full['days_since'] = (df_full['date'] - df_full['last_nz']).dt.days.fillna(999).astype(int)
 
-    # 4. Подготовка данных для регрессии на все дни (включая нули)
+    # Новая фича: типичный день платежа в месяце
+    modes = (
+        df_full[df_full['amount'] > 0]
+        .groupby('category')['day']
+        .agg(lambda x: x.mode()[0] if not x.mode().empty else 1)
+    )
+    df_full['monthly_day'] = df_full['category'].map(modes)
+    df_full['is_monthly_day'] = (df_full['day'] == df_full['monthly_day']).astype(int)
+    df_full['dist_to_monthly_day'] = (df_full['day'] - df_full['monthly_day']).abs()
+
+    # 4. Подготовка данных для регрессии
     features = [
         'category','day','month','dow','is_weekend',
-        'lag_1','lag_7','lag_30','roll30_mean','roll30_std','days_since'
+        'lag_1','lag_7','lag_30','roll30_mean','roll30_std',
+        'days_since','is_monthly_day','dist_to_monthly_day'
     ]
     cat_feats = ['category']
     X_full = df_full[features].copy()
     X_full['category'] = X_full['category'].astype('category')
     y_full = df_full['amount']
 
-    # 5. Обучение одного регрессора на всех данных
+    # 5. Обучение регрессора
     reg_all = CatBoostRegressor(
         iterations=300,
         learning_rate=0.05,
@@ -98,6 +108,8 @@ def forecast(req: ForecastRequest):
     reg_all.fit(X_full, y_full, cat_features=cat_feats)
 
     # 6. Прогноз на будущее
+    # Сохраняем типичный день для доступа при прогнозе
+    monthly_map = modes.to_dict()
     last_date = df_full['date'].max()
     hist = df_full.copy()
     future_preds = []
@@ -106,6 +118,7 @@ def forecast(req: ForecastRequest):
         d = last_date + pd.Timedelta(days=i)
         for cat in categories:
             sub = hist[hist['category'] == cat]
+            md = monthly_map.get(cat, 1)
             row = {
                 'category': cat,
                 'day': d.day,
@@ -117,7 +130,9 @@ def forecast(req: ForecastRequest):
                 'lag_30': sub['amount'].shift(29).iloc[-1] if len(sub) >= 30 else 0,
                 'roll30_mean': sub['amount'].shift(1).rolling(30, min_periods=1).mean().iloc[-1],
                 'roll30_std': sub['amount'].shift(1).rolling(30, min_periods=1).std().fillna(0).iloc[-1],
-                'days_since': int((d - (sub[sub['amount']>0]['date'].max() if not sub[sub['amount']>0].empty else d)).days)
+                'days_since': int((d - (sub[sub['amount']>0]['date'].max() if not sub[sub['amount']>0].empty else d)).days),
+                'is_monthly_day': int(d.day == md),
+                'dist_to_monthly_day': abs(d.day - md)
             }
             Xf = pd.DataFrame([row])[features]
             Xf['category'] = Xf['category'].astype('category')
