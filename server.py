@@ -39,6 +39,22 @@ class Recommendation(BaseModel):
 class RecommendationsResponse(BaseModel):
     recommendations: List[Recommendation]
 
+    predictions: List[Prediction]
+
+# --- Pydantic models for recommendations ---
+class RecommendationsRequest(BaseModel):
+    avg_totals: Dict[str, float]
+    last_totals: Dict[str, float]
+
+class Recommendation(BaseModel):
+    category: str
+    current: float
+    benchmark: float
+    advice: str
+
+class RecommendationsResponse(BaseModel):
+    recommendations: List[Recommendation]
+
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"error": str(exc)})
@@ -136,7 +152,7 @@ def forecast(req: ForecastRequest):
             future.append({'date':d.strftime('%Y-%m-%d'),'category':cat,'value':val})
             hist = pd.concat([hist,pd.DataFrame([{**row,'amount':val,'date':d}])],ignore_index=True)
 
-    return ForecastResponse(predictions=future)
+        return ForecastResponse(predictions=future)
 
 # --- Recommendations endpoint ---
 @app.post("/recommendations", response_model=RecommendationsResponse)
@@ -148,6 +164,24 @@ def recommendations(req: RecommendationsRequest):
         if avg > 0 and current > avg * threshold:
             reduction = round((current - avg) / current * 100)
             advice = f"Постарайтесь сократить траты на {cat} на {reduction}% — используйте скидки и кешбэк."
+            recs.append(Recommendation(
+                category=cat,
+                current=current,
+                benchmark=avg,
+                advice=advice
+            ))
+    return RecommendationsResponse(recommendations=recs)
+
+# --- Recommendations endpoint ---
+@app.post("/recommendations", response_model=RecommendationsResponse)
+def recommendations(req: RecommendationsRequest):
+    recs: List[Recommendation] = []
+    threshold = 1.1  # recommend if current > 110% of avg
+    for cat, current in req.last_totals.items():
+        avg = req.avg_totals.get(cat, 0)
+        if avg > 0 and current > avg * threshold:
+            reduction = round((current - avg) / current * 100)
+            advice = f"Постарайтесь сократить траты на {cat} на {reduction}%"
             recs.append(Recommendation(
                 category=cat,
                 current=current,
