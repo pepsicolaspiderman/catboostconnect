@@ -140,8 +140,7 @@ def recommendations(req: RecommendationsRequest):
             reduction = (current - benchmark) / current
             percent = round(reduction * 100)
             advice = (
-                f"Постарайтесь сократить траты на «{cat}» примерно на {percent}% — "
-                f"ваш текущий месяц: {current:.0f}₽, среднее: {benchmark:.0f}₽."
+                f"Постарайтесь сократить траты на «{cat}» примерно на {percent}% "
             )
             recommendations.append(RecommendationItem(
                 category=cat,
