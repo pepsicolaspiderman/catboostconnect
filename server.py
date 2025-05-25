@@ -20,9 +20,13 @@ class ForecastRequest(BaseModel):
     transactions: List[Transaction]
     forecast_days: int = Field(..., gt=0, description="Число дней вперёд для прогноза")
 
+class Prediction(BaseModel):
+    date: str
+    value: float
+
 class ForecastResponse(BaseModel):
     metrics: Dict[str, Dict[str, float]]
-    predictions: List[Dict[str, float]]
+    predictions: List[Prediction]
 
 # Global exception handler to return error details
 @app.exception_handler(Exception)
@@ -71,7 +75,6 @@ def forecast(req: ForecastRequest):
         df_full.groupby('category')['amount']
                .transform(lambda x: x.shift(1).rolling(30, min_periods=1).std().fillna(0))
     )
-    # days since last non-zero
     df_full['last_nonzero_date'] = df_full['date'].where(df_full['amount'] > 0)
     df_full['last_nonzero_date'] = df_full.groupby('category')['last_nonzero_date'].ffill()
     df_full['days_since_last'] = (
@@ -95,14 +98,16 @@ def forecast(req: ForecastRequest):
     clf = CatBoostClassifier(
         iterations=200, learning_rate=0.1,
         depth=6, random_seed=42, verbose=False,
-        allow_writing_files=False)
+        allow_writing_files=False
+    )
     clf.fit(X, y_bin, cat_features=cat_features)
 
     reg = CatBoostRegressor(
         iterations=300, learning_rate=0.05,
         depth=6, l2_leaf_reg=5,
         random_seed=42, verbose=False,
-        allow_writing_files=False)
+        allow_writing_files=False
+    )
     reg.fit(X.loc[mask], y_amt, cat_features=cat_features)
 
     # 6. In-sample metrics
@@ -133,7 +138,6 @@ def forecast(req: ForecastRequest):
         d = last_date + pd.Timedelta(days=i)
         for cat in all_cats:
             subset = temp_df[temp_df['category'] == cat]
-            # Build feature row
             feat = {
                 'category': cat,
                 'day': d.day,
@@ -156,7 +160,6 @@ def forecast(req: ForecastRequest):
                 'value': round(amt_p, 2)
             })
 
-            # Append to temp_df for next lag
             new_row = {**feat, 'amount': amt_p, 'target_bin': bin_p, 'date': d}
             new_rec = pd.DataFrame([new_row])
             new_rec['date'] = pd.to_datetime(new_rec['date'])
@@ -165,9 +168,6 @@ def forecast(req: ForecastRequest):
     return ForecastResponse(metrics=metrics, predictions=future)
 
 # Run on port 80
-def start():
+if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=80)
-
-if __name__ == "__main__":
-    start()
