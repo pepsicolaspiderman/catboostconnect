@@ -1,30 +1,29 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Dict
 import pandas as pd
 from catboost import CatBoostClassifier, CatBoostRegressor
 
 app = FastAPI(title="Сервис прогнозирования трат по категориям")
 
-# Pydantic-модели
-def build_transaction_models():
-    class Transaction(BaseModel):
-        date: str  # "YYYY-MM-DD"
-        category: str
-        amount: float
-    class ForecastRequest(BaseModel):
-        transactions: List[Transaction]
-        forecast_days: int = Field(..., gt=0)
-    class Prediction(BaseModel):
-        date: str
-        category: str
-        value: float
-    class ForecastResponse(BaseModel):
-        predictions: List[Prediction]
-    return Transaction, ForecastRequest, Prediction, ForecastResponse
+# Pydantic models
+class Transaction(BaseModel):
+    date: str  # "YYYY-MM-DD"
+    category: str
+    amount: float
 
-Transaction, ForecastRequest, Prediction, ForecastResponse = build_transaction_models()
+class ForecastRequest(BaseModel):
+    transactions: List[Transaction]
+    forecast_days: int = Field(..., gt=0)
+
+class Prediction(BaseModel):
+    date: str
+    category: str
+    value: float
+
+class ForecastResponse(BaseModel):
+    predictions: List[Prediction]
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
@@ -32,46 +31,51 @@ async def generic_exception_handler(request: Request, exc: Exception):
 
 @app.post("/forecast", response_model=ForecastResponse)
 def forecast(req: ForecastRequest):
-    # 1. Собираем историю
+    # 1. Load and prepare input data
     df = pd.DataFrame([t.dict() for t in req.transactions])
     if df.empty:
         raise HTTPException(status_code=400, detail="Список транзакций пуст")
     df['date'] = pd.to_datetime(df['date'])
     cats = df['category'].unique()
 
-    # 2. Ресемплинг и фичи на всю историю + будущие дни
-    all_frames = []
+    # 2. Build full daily series including future days placeholder
+    frames = []
     for cat in cats:
-        sub = df[df['category']==cat].set_index('date')['amount']
-        series = sub.resample('D').sum().rename('amount')
-        # добавляем будущие дни с NaN
+        series = df[df['category']==cat].set_index('date')['amount'].resample('D').sum()
         last = series.index.max()
         future_idx = pd.date_range(last + pd.Timedelta(days=1), periods=req.forecast_days, freq='D')
-        series = pd.concat([series, pd.Series(data=[0]*len(future_idx), index=future_idx, name='amount')])
-        frame = series.to_frame()
+        series = pd.concat([series, pd.Series(0, index=future_idx)])
+        frame = series.to_frame(name='amount')
         frame['category'] = cat
-        frame['day'] = frame.index.day
-        frame['month'] = frame.index.month
-        frame['dow'] = frame.index.dayofweek
-        frame['is_weekend'] = frame['dow'].isin([5,6]).astype(int)
-        # лаги и скользящие средние
-        frame['lag_1'] = frame['amount'].shift(1).fillna(0)
-        frame['lag_7'] = frame['amount'].shift(7).fillna(0)
-        frame['rolling_30_mean'] = frame['amount'].shift(1).rolling(30, min_periods=1).mean()
-        frame['rolling_30_std'] = frame['amount'].shift(1).rolling(30, min_periods=1).std().fillna(0)
         frame = frame.reset_index().rename(columns={'index':'date'})
-        all_frames.append(frame)
-    full = pd.concat(all_frames, ignore_index=True)
+        frames.append(frame)
+    full = pd.concat(frames, ignore_index=True).sort_values(['category','date']).reset_index(drop=True)
 
-    # 3. Метки для обучения только на исторических датах
-    full['is_future'] = full['date'] > full['date'].max() - pd.Timedelta(days=req.forecast_days)
+    # 3. Label future vs train
+    full['is_future'] = full.groupby('category')['date'].transform(lambda x: x > x.max() - pd.Timedelta(days=req.forecast_days))
+    train = full[~full['is_future']].copy()
+
+    # 4. Feature generation
+    def gen_feats(df_in: pd.DataFrame) -> pd.DataFrame:
+        df = df_in.copy()
+        df['day'] = df['date'].dt.day
+        df['month'] = df['date'].dt.month
+        df['dow'] = df['date'].dt.dayofweek
+        df['is_weekend'] = df['dow'].isin([5,6]).astype(int)
+        df['lag_1'] = df.groupby('category')['amount'].shift(1).fillna(0)
+        df['lag_7'] = df.groupby('category')['amount'].shift(7).fillna(0)
+        df['rolling_30_mean'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(30, min_periods=1).mean())
+        df['rolling_30_std']  = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(30, min_periods=1).std().fillna(0))
+        return df
+
+    full = gen_feats(full)
     train = full[~full['is_future']]
     X_train = train[['category','day','month','dow','is_weekend','lag_1','lag_7','rolling_30_mean','rolling_30_std']].copy()
     X_train['category'] = X_train['category'].astype('category')
     y_bin = (train['amount']>0).astype(int)
     y_amt = train.loc[y_bin==1,'amount']
 
-    # 4. Обучаем CatBoostClassifier и CatBoostRegressor как в вашем скрипте
+    # 5. Train classifier and regressor
     clf = CatBoostClassifier(iterations=200, learning_rate=0.1, depth=6,
                              random_seed=42, verbose=False, allow_writing_files=False)
     clf.fit(X_train, y_bin, cat_features=['category'])
@@ -80,22 +84,33 @@ def forecast(req: ForecastRequest):
                             verbose=False, allow_writing_files=False)
     reg.fit(X_train[y_bin==1], y_amt, cat_features=['category'])
 
-    # 5. Предсказание на всех датах (история+будущее)
-    X_pred = full[['category','day','month','dow','is_weekend','lag_1','lag_7','rolling_30_mean','rolling_30_std']].copy()
-    X_pred['category'] = X_pred['category'].astype('category')
-    p = clf.predict_proba(X_pred)[:,1]
-    r = reg.predict(X_pred)
-    full['pred'] = (p * r).round(2)
+    # 6. Rare vs frequent categorization
+    freq = train.groupby('category').apply(lambda x: (x['amount']>0).mean())
+    modes = (train[train['amount']>0].groupby('category')['date']
+             .agg(lambda x: x.dt.day.mode().iat[0] if not x.dt.day.mode().empty else 1))
+    sum30 = train.groupby('category')['amount'].apply(lambda x: x.tail(30).sum())
 
-    # 6. Собираем только будущие прогнозы
-    future = full[full['is_future']]
+    # 7. Predict future
+    feats = ['category','day','month','dow','is_weekend','lag_1','lag_7','rolling_30_mean','rolling_30_std']
     out = []
-    for _, row in future.iterrows():
-        out.append({
-            'date': row['date'].strftime('%Y-%m-%d'),
-            'category': row['category'],
-            'value': row['pred']
-        })
+    for cat in cats:
+        sub = full[full['category']==cat]
+        cat_freq = freq.get(cat, 0)
+        cat_mode = modes.get(cat, 1)
+        cat_sum30 = sum30.get(cat, 0)
+        for _, row in sub[sub['is_future']].iterrows():
+            d = row['date']
+            if cat_freq < 0.1:
+                # rare: only pay once on typical day
+                val = round(cat_sum30, 2) if d.day==cat_mode else 0.0
+            else:
+                # frequent: use p * r
+                Xf = row[feats].to_frame().T
+                Xf['category'] = Xf['category'].astype('category')
+                p = clf.predict_proba(Xf)[0,1]
+                r = reg.predict(Xf)[0]
+                val = max(0.0, float(round(p*r,2)))
+            out.append({'date': d.strftime('%Y-%m-%d'), 'category': cat, 'value': val})
 
     return ForecastResponse(predictions=out)
 
