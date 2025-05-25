@@ -92,13 +92,17 @@ def forecast(req: ForecastRequest):
     y_amt = df_full.loc[mask, 'amount']
 
     # 5. Train models (CatBoost)
-    clf = CatBoostClassifier(iterations=200, learning_rate=0.1,
-                             depth=6, random_seed=42, verbose=False)
+    clf = CatBoostClassifier(
+        iterations=200, learning_rate=0.1,
+        depth=6, random_seed=42, verbose=False,
+        allow_writing_files=False)
     clf.fit(X, y_bin, cat_features=cat_features)
 
-    reg = CatBoostRegressor(iterations=300, learning_rate=0.05,
-                            depth=6, l2_leaf_reg=5,
-                            random_seed=42, verbose=False)
+    reg = CatBoostRegressor(
+        iterations=300, learning_rate=0.05,
+        depth=6, l2_leaf_reg=5,
+        random_seed=42, verbose=False,
+        allow_writing_files=False)
     reg.fit(X.loc[mask], y_amt, cat_features=cat_features)
 
     # 6. In-sample metrics
