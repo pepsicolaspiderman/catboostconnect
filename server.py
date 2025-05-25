@@ -163,7 +163,7 @@ def recommendations(req: RecommendationsRequest):
         avg = req.avg_totals.get(cat, 0)
         if avg > 0 and current > avg * threshold:
             reduction = round((current - avg) / current * 100)
-            advice = f"Постарайтесь сократить траты на {cat} на {reduction}% — используйте скидки и кешбэк."
+            advice = f"Постарайтесь сократить траты на {cat} на {reduction}%"
             recs.append(Recommendation(
                 category=cat,
                 current=current,
