@@ -146,7 +146,7 @@ def forecast(req: ForecastRequest):
             # добавляем в результат
             future.append({'date': d.strftime('%Y-%m-%d'), 'category': cat, 'value': round(val,2)})
     
-    return ForecastResponse(predictions=future)(predictions=future)
+    return ForecastResponse(predictions=future)
 
 if __name__ == '__main__':
     import uvicorn
