@@ -114,6 +114,44 @@ def forecast(req: ForecastRequest):
 
     return ForecastResponse(predictions=out)
 
+# Pydantic-модели для рекомендаций
+class RecommendationsRequest(BaseModel):
+    avg_totals: Dict[str, float]
+    last_totals: Dict[str, float]
+
+class RecommendationItem(BaseModel):
+    category: str
+    current: float
+    benchmark: float
+    advice: str
+
+class RecommendationsResponse(BaseModel):
+    recommendations: List[RecommendationItem]
+
+# Новый endpoint для рекомендаций
+@app.post("/recommendations", response_model=RecommendationsResponse)
+def recommendations(req: RecommendationsRequest):
+    recommendations: List[RecommendationItem] = []
+    # Порог, выше которого даём совет сократить расходы
+    threshold = 1.1  # 10% выше среднего
+    for cat, current in req.last_totals.items():
+        benchmark = req.avg_totals.get(cat, 0.0)
+        if benchmark > 0 and current > benchmark * threshold:
+            reduction = (current - benchmark) / current
+            percent = round(reduction * 100)
+            advice = (
+                f"Постарайтесь сократить траты на «{cat}» примерно на {percent}% — "
+                f"ваш текущий месяц: {current:.0f}₽, среднее: {benchmark:.0f}₽."
+            )
+            recommendations.append(RecommendationItem(
+                category=cat,
+                current=current,
+                benchmark=benchmark,
+                advice=advice
+            ))
+    return RecommendationsResponse(recommendations=recommendations)
+
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run('server:app', host='0.0.0.0', port=80)
