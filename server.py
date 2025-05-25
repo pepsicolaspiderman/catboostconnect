@@ -7,7 +7,7 @@ from catboost import CatBoostClassifier, CatBoostRegressor
 
 app = FastAPI(title="Сервис прогнозирования трат по категориям")
 
-# --- Pydantic models for forecasting ---
+# Pydantic models
 class Transaction(BaseModel):
     date: str  # "YYYY-MM-DD"
     category: str
@@ -25,25 +25,10 @@ class Prediction(BaseModel):
 class ForecastResponse(BaseModel):
     predictions: List[Prediction]
 
-# --- Pydantic models for recommendations ---
-class RecommendationsRequest(BaseModel):
-    avg_totals: Dict[str, float]
-    last_totals: Dict[str, float]
-
-class Recommendation(BaseModel):
-    category: str
-    current: float
-    benchmark: float
-    advice: str
-
-class RecommendationsResponse(BaseModel):
-    recommendations: List[Recommendation]
-
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"error": str(exc)})
 
-# --- Forecast endpoint (original logic) ---
 @app.post("/forecast", response_model=ForecastResponse)
 def forecast(req: ForecastRequest):
     # 1. Load and prepare input data
@@ -51,110 +36,83 @@ def forecast(req: ForecastRequest):
     if df.empty:
         raise HTTPException(status_code=400, detail="Список транзакций пуст")
     df['date'] = pd.to_datetime(df['date'])
-    categories = df['category'].unique()
+    cats = df['category'].unique()
 
-    # 2. Resample daily and fill zeros
+    # 2. Build full daily series including future days placeholder
     frames = []
-    for cat in categories:
-        tmp = (
-            df[df['category']==cat]
-              .set_index('date')['amount']
-              .resample('D').sum()
-              .to_frame()
-        )
-        tmp['category'] = cat
-        tmp['amount'] = tmp['amount'].fillna(0)
-        frames.append(tmp.reset_index())
-    df_full = pd.concat(frames, ignore_index=True)
+    for cat in cats:
+        series = df[df['category']==cat].set_index('date')['amount'].resample('D').sum()
+        last = series.index.max()
+        future_idx = pd.date_range(last + pd.Timedelta(days=1), periods=req.forecast_days, freq='D')
+        series = pd.concat([series, pd.Series(0, index=future_idx)])
+        frame = series.to_frame(name='amount')
+        frame['category'] = cat
+        frame = frame.reset_index().rename(columns={'index':'date'})
+        frames.append(frame)
+    full = pd.concat(frames, ignore_index=True).sort_values(['category','date']).reset_index(drop=True)
 
-    # 3. Generate features
-    df_full['category'] = df_full['category'].astype('category')
-    df_full['day'] = df_full['date'].dt.day
-    df_full['month'] = df_full['date'].dt.month
-    df_full['dow'] = df_full['date'].dt.dayofweek
-    df_full['is_weekend'] = df_full['dow'].isin([5,6]).astype(int)
-    df_full = df_full.sort_values(['category','date'])
-    df_full['lag_1'] = df_full.groupby('category')['amount'].shift(1).fillna(0)
-    df_full['lag_7'] = df_full.groupby('category')['amount'].shift(7).fillna(0)
-    df_full['roll30_mean'] = (
-        df_full.groupby('category')['amount']
-               .transform(lambda x: x.shift(1).rolling(30, min_periods=1).mean())
-    )
-    df_full['roll30_std'] = (
-        df_full.groupby('category')['amount']
-               .transform(lambda x: x.shift(1).rolling(30, min_periods=1).std().fillna(0))
-    )
-    df_full['last_nz'] = df_full['date'].where(df_full['amount']>0)
-    df_full['last_nz'] = df_full.groupby('category')['last_nz'].ffill()
-    df_full['days_since'] = (df_full['date'] - df_full['last_nz']).dt.days.fillna(999).astype(int)
+    # 3. Label future vs train
+    full['is_future'] = full.groupby('category')['date'].transform(lambda x: x > x.max() - pd.Timedelta(days=req.forecast_days))
+    train = full[~full['is_future']].copy()
 
-    # 4. Prepare training data
-    df_full['target_bin'] = (df_full['amount']>0).astype(int)
-    features = ['category','day','month','dow','is_weekend','lag_1','lag_7','roll30_mean','roll30_std','days_since']
-    X = df_full[features].copy()
-    X['category'] = X['category'].astype('category')
-    y_bin = df_full['target_bin']
-    mask = y_bin==1
-    y_amt = df_full.loc[mask,'amount']
+    # 4. Feature generation
+    def gen_feats(df_in: pd.DataFrame) -> pd.DataFrame:
+        df = df_in.copy()
+        df['day'] = df['date'].dt.day
+        df['month'] = df['date'].dt.month
+        df['dow'] = df['date'].dt.dayofweek
+        df['is_weekend'] = df['dow'].isin([5,6]).astype(int)
+        df['lag_1'] = df.groupby('category')['amount'].shift(1).fillna(0)
+        df['lag_7'] = df.groupby('category')['amount'].shift(7).fillna(0)
+        df['rolling_30_mean'] = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(30, min_periods=1).mean())
+        df['rolling_30_std']  = df.groupby('category')['amount'].transform(lambda x: x.shift(1).rolling(30, min_periods=1).std().fillna(0))
+        return df
 
-    # 5. Train models
-    clf = CatBoostClassifier(
-        iterations=200, learning_rate=0.1, depth=6,
-        random_seed=42, verbose=False, allow_writing_files=False
-    )
-    clf.fit(X, y_bin, cat_features=['category'])
+    full = gen_feats(full)
+    train = full[~full['is_future']]
+    X_train = train[['category','day','month','dow','is_weekend','lag_1','lag_7','rolling_30_mean','rolling_30_std']].copy()
+    X_train['category'] = X_train['category'].astype('category')
+    y_bin = (train['amount']>0).astype(int)
+    y_amt = train.loc[y_bin==1,'amount']
 
-    reg = CatBoostRegressor(
-        iterations=300, learning_rate=0.05, depth=6, l2_leaf_reg=5,
-        random_seed=42, verbose=False, allow_writing_files=False
-    )
-    reg.fit(X.loc[mask], y_amt, cat_features=['category'])
+    # 5. Train classifier and regressor
+    clf = CatBoostClassifier(iterations=200, learning_rate=0.1, depth=6,
+                             random_seed=42, verbose=False, allow_writing_files=False)
+    clf.fit(X_train, y_bin, cat_features=['category'])
+    reg = CatBoostRegressor(iterations=300, learning_rate=0.05, depth=6,
+                            l2_leaf_reg=5, random_seed=42,
+                            verbose=False, allow_writing_files=False)
+    reg.fit(X_train[y_bin==1], y_amt, cat_features=['category'])
 
-    # 6. Forecast
-    last_date = df_full['date'].max()
-    hist = df_full.copy()
-    future = []
-    for i in range(1, req.forecast_days+1):
-        d = last_date + pd.Timedelta(days=i)
-        for cat in categories:
-            sub = hist[hist['category']==cat]
-            row = {
-                'category':cat,
-                'day':d.day, 'month':d.month, 'dow':d.dayofweek,
-                'is_weekend':int(d.dayofweek in [5,6]),
-                'lag_1':sub['amount'].iloc[-1],
-                'lag_7':sub['amount'].shift(6).iloc[-1] if len(sub)>=7 else 0,
-                'roll30_mean':sub['amount'].shift(1).rolling(30, min_periods=1).mean().iloc[-1],
-                'roll30_std':sub['amount'].shift(1).rolling(30, min_periods=1).std().fillna(0).iloc[-1],
-                'days_since':int((d - (sub[sub['amount']>0]['date'].max() if not sub[sub['amount']>0].empty else d)).days)
-            }
-            Xf = pd.DataFrame([row])[features]
-            Xf['category'] = Xf['category'].astype('category')
-            p = clf.predict_proba(Xf)[0,1]
-            r = float(reg.predict(Xf)[0])
-            val = max(0.0, round(p*r,2))
-            future.append({'date':d.strftime('%Y-%m-%d'),'category':cat,'value':val})
-            hist = pd.concat([hist,pd.DataFrame([{**row,'amount':val,'date':d}])],ignore_index=True)
-    # return after loops
-    return ForecastResponse(predictions=future)
+    # 6. Rare vs frequent categorization
+    freq = train.groupby('category').apply(lambda x: (x['amount']>0).mean())
+    modes = (train[train['amount']>0].groupby('category')['date']
+             .agg(lambda x: x.dt.day.mode().iat[0] if not x.dt.day.mode().empty else 1))
+    sum30 = train.groupby('category')['amount'].apply(lambda x: x.tail(30).sum())
 
-# --- Recommendations endpoint ---
-@app.post("/recommendations", response_model=RecommendationsResponse)
-def recommendations(req: RecommendationsRequest):
-    recs: List[Recommendation] = []
-    threshold = 1.1  # recommend if current > 110% of avg
-    for cat, current in req.last_totals.items():
-        avg = req.avg_totals.get(cat, 0)
-        if avg > 0 and current > avg * threshold:
-            reduction = round((current - avg) / current * 100)
-            advice = f"Постарайтесь сократить траты на {cat} на {reduction}%."
-            recs.append(Recommendation(
-                category=cat,
-                current=current,
-                benchmark=avg,
-                advice=advice
-            ))
-    return RecommendationsResponse(recommendations=recs)
+    # 7. Predict future
+    feats = ['category','day','month','dow','is_weekend','lag_1','lag_7','rolling_30_mean','rolling_30_std']
+    out = []
+    for cat in cats:
+        sub = full[full['category']==cat]
+        cat_freq = freq.get(cat, 0)
+        cat_mode = modes.get(cat, 1)
+        cat_sum30 = sum30.get(cat, 0)
+        for _, row in sub[sub['is_future']].iterrows():
+            d = row['date']
+            if cat_freq < 0.1:
+                # rare: only pay once on typical day
+                val = round(cat_sum30, 2) if d.day==cat_mode else 0.0
+            else:
+                # frequent: use p * r
+                Xf = row[feats].to_frame().T
+                Xf['category'] = Xf['category'].astype('category')
+                p = clf.predict_proba(Xf)[0,1]
+                r = reg.predict(Xf)[0]
+                val = max(0.0, float(round(p*r,2)))
+            out.append({'date': d.strftime('%Y-%m-%d'), 'category': cat, 'value': val})
+
+    return ForecastResponse(predictions=out)
 
 if __name__ == '__main__':
     import uvicorn
